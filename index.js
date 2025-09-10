@@ -1,451 +1,507 @@
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const cors = require("cors");
-const { v4: uuidv4 } = require("uuid");
+
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
-
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: "*", // Configure properly for production
-    methods: ["GET", "POST"],
-  },
+  cors: { origin: '*' },
+  pingTimeout: 60000,
+  pingInterval: 25000,
 });
 
-// Data structures to manage calls and users
-const activeCalls = new Map(); // roomId -> callData
-const userSockets = new Map(); // userId -> socketId
-const userRooms = new Map(); // userId -> roomId
+// In-memory storage
+const connectedUsers = new Map();
+const activeCalls = new Map();
+const pendingSignals = new Map();
+const userStatus = new Map();
+const callTimeouts = new Map();
+const callStates = new Map(); // Enhanced call state tracking
 
-// Logging utility
-const log = (level, message, meta = {}) => {
-  const timestamp = new Date().toISOString();
-  console.log(JSON.stringify({ timestamp, level, message, ...meta }));
-};
+// Utilities
+function getUserSocket(userId) {
+  const socket = connectedUsers.get(userId);
+  console.log(`[UTIL] Getting socket for ${userId}: ${socket ? socket.id : 'not found'}`);
+  return socket;
+}
 
-// Utility functions
-const isValidCallData = (data) => {
-  const isValid = data && data.callerId && data.receiverId && data.type;
-  if (!isValid) {
-    log("warn", "Invalid call data received", { data });
-  }
-  return isValid;
-};
+function getUserStatus(userId) {
+  const status = userStatus.get(userId) || { status: 'available', currentCallId: null };
+  console.log(`[UTIL] Getting status for ${userId}: ${status.status}, call: ${status.currentCallId}`);
+  return status;
+}
 
-const getCallByUserId = (userId) => {
-  for (const [roomId, callData] of activeCalls.entries()) {
-    if (callData.participants.includes(userId)) {
-      return { roomId, callData };
-    }
-  }
-  return null;
-};
+function setUserStatus(userId, status, currentCallId = null) {
+  userStatus.set(userId, { status, currentCallId });
+  console.log(`[STATUS] User ${userId} set to ${status} (call: ${currentCallId})`);
+}
 
-const isUserInCall = (userId) => {
-  const inCall = userRooms.has(userId);
-  log("debug", "Checking if user is in call", { userId, inCall });
-  return inCall;
-};
+function queueSignal(userId, event, data) {
+  if (!pendingSignals.has(userId)) pendingSignals.set(userId, []);
+  pendingSignals.get(userId).push({ event, data });
+  console.log(`[QUEUE] Queued ${event} for ${userId}`);
+}
 
-// Middleware to authenticate socket connections
-io.use((socket, next) => {
-  const { userId } = socket.handshake.query;
-  if (!userId) {
-    log("error", "Authentication error: userId required", { socketId: socket.id });
-    return next(new Error("Authentication error: userId required"));
-  }
-  socket.userId = userId;
-  log("info", "User authentication successful", { userId, socketId: socket.id });
-  next();
-});
-
-io.on("connection", (socket) => {
-  const userId = socket.userId;
-  log("info", "User connected", { userId, socketId: socket.id });
-
-  // Store user socket mapping
-  userSockets.set(userId, socket.id);
-  socket.join(userId);
-  log("debug", "User joined their own room", { userId, socketId: socket.id });
-
-  // Handle call initiation
-  socket.on("call:initiate", (callData) => {
-    try {
-      log("info", "Call initiation requested", { userId, callData });
-      if (!isValidCallData(callData)) {
-        socket.emit("call:signal-error", { message: "Invalid call data" });
-        return;
-      }
-
-      // Check if receiver is available
-      if (isUserInCall(callData.receiverId)) {
-        log("warn", "Receiver is already in a call", {
-          userId,
-          receiverId: callData.receiverId,
-        });
-        socket.emit("call:busy", callData);
-        return;
-      }
-
-      const roomId = callData.roomId || uuidv4();
-      callData.roomId = roomId;
-      callData.participants = [callData.callerId];
-      callData.timestamp = Date.now();
-      callData.status = "ringing";
-
-      // Store call data
-      activeCalls.set(roomId, callData);
-      userRooms.set(callData.callerId, roomId);
-      log("info", "Call data stored", { roomId, callData });
-
-      // Join the room
-      socket.join(roomId);
-      log("debug", "Caller joined call room", { userId, roomId });
-
-      // Notify receiver with the offer
-      io.to(callData.receiverId).emit("call:incoming", {
-        ...callData,
-        offer: callData.offer,
-      });
-      log("info", "Notified receiver of incoming call", {
-        receiverId: callData.receiverId,
-        roomId,
-      });
-
-      // Notify caller that call is ringing
-      socket.emit("call:ringing", callData);
-      log("debug", "Notified caller of ringing status", { userId, roomId });
-    } catch (error) {
-      log("error", "Error in call initiation", { userId, roomId: callData.roomId, error: error.message });
-      socket.emit("call:signal-error", { message: "Failed to initiate call" });
-    }
+function deliverPendingSignals(userId, socket) {
+  if (!pendingSignals.has(userId)) return;
+  const signals = pendingSignals.get(userId);
+  signals.forEach(({ event, data }) => {
+    console.log(`[DELIVER] Delivering pending ${event} to ${userId}`);
+    socket.emit(event, data);
   });
+  pendingSignals.delete(userId);
+}
 
-  // Handle call acceptance
-  socket.on("call:accept", (callData) => {
-    try {
-      const { roomId } = callData;
-      const call = activeCalls.get(roomId);
-      log("info", "Call acceptance requested", { userId, roomId });
-
-      if (!call) {
-        log("warn", "Call does not exist", { userId, roomId });
-        socket.emit("call:signal-error", { message: "Call does not exist" });
-        return;
-      }
-
-      // Update call data
-      call.status = "in-call";
-      call.participants.push(callData.receiverId);
-      activeCalls.set(roomId, call);
-      userRooms.set(callData.receiverId, roomId);
-      log("info", "Call status updated to in-call", { roomId, participants: call.participants });
-
-      // Join the room
-      socket.join(roomId);
-      log("debug", "Receiver joined call room", { userId, roomId });
-
-      // Notify all participants
-      io.to(roomId).emit("call:accepted", callData);
-      io.to(roomId).emit("call:connected", callData);
-      log("info", "Notified participants of call acceptance and connection", { roomId });
-    } catch (error) {
-      log("error", "Error in call acceptance", { userId, roomId: callData.roomId, error: error.message });
-      socket.emit("call:signal-error", { message: "Failed to accept call" });
-    }
-  });
-
-  // Handle call rejection
-  socket.on("call:reject", (callData) => {
-    try {
-      const { roomId } = callData;
-      const call = activeCalls.get(roomId);
-      log("info", "Call rejection requested", { userId, roomId });
-
-      if (call) {
-        io.to(roomId).emit("call:rejected", callData);
-        cleanupCall(roomId);
-        log("info", "Notified participants of call rejection and cleaned up", { roomId });
-      } else {
-        log("warn", "Attempted to reject non-existent call", { userId, roomId });
-      }
-    } catch (error) {
-      log("error", "Error in call rejection", { userId, roomId: callData.roomId, error: error.message });
-    }
-  });
-
-  // Handle call end
-  socket.on("call:end", (callData) => {
-    try {
-      const { roomId } = callData;
-      const call = activeCalls.get(roomId);
-      log("info", "Call end requested", { userId, roomId });
-
-      if (call) {
-        io.to(roomId).emit("call:ended", callData);
-        cleanupCall(roomId);
-        log("info", "Notified participants of call end and cleaned up", { roomId });
-      } else {
-        log("warn", "Attempted to end non-existent call", { userId, roomId });
-      }
-    } catch (error) {
-      log("error", "Error in call end", { userId, roomId: callData.roomId, error: error.message });
-    }
-  });
-
-  // Handle WebRTC signaling
-  socket.on("call:offer", (data) => {
-    try {
-      const targetId = data.senderId === data.callerId ? data.receiverId : data.callerId;
-      log("debug", "Relaying WebRTC offer", { userId, targetId, roomId: data.roomId });
-      io.to(targetId).emit("call:offer", data);
-    } catch (error) {
-      log("error", "Error relaying WebRTC offer", { userId, roomId: data.roomId, error: error.message });
-    }
-  });
-
-  socket.on("call:answer", (data) => {
-    try {
-      const targetId = data.senderId === data.callerId ? data.receiverId : data.callerId;
-      log("debug", "Relaying WebRTC answer", { userId, targetId, roomId: data.roomId });
-      io.to(targetId).emit("call:answer", data);
-    } catch (error) {
-      log("error", "Error relaying WebRTC answer", { userId, roomId: data.roomId, error: error.message });
-    }
-  });
-
-  socket.on("call:candidate", (data) => {
-    try {
-      log("debug", "Relaying ICE candidate", { userId, targetId: data.targetId, roomId: data.roomId });
-      io.to(data.targetId).emit("call:candidate", data);
-    } catch (error) {
-      log("error", "Error relaying ICE candidate", { userId, roomId: data.roomId, error: error.message });
-    }
-  });
-
-  // Handle media control events
-  socket.on("call:mute-toggle", (data) => {
-    try {
-      const { roomId } = data;
-      log("info", "Mute toggle requested", { userId, roomId, isMuted: data.isMuted });
-      socket.to(roomId).emit("call:mute-toggle", data);
-    } catch (error) {
-      log("error", "Error in mute toggle", { userId, roomId, error: error.message });
-    }
-  });
-
-  socket.on("call:video-toggle", (data) => {
-    try {
-      const { roomId } = data;
-      log("info", "Video toggle requested", { userId, roomId, isVideoEnabled: data.isVideoEnabled });
-      socket.to(roomId).emit("call:video-toggle", data);
-    } catch (error) {
-      log("error", "Error in video toggle", { userId, roomId, error: error.message });
-    }
-  });
-
-  // Handle call hold/resume
-  socket.on("call:hold", (callData) => {
-    try {
-      const { roomId } = callData;
-      log("info", "Call hold requested", { userId, roomId });
-      socket.to(roomId).emit("call:hold", callData);
-    } catch (error) {
-      log("error", "Error in call hold", { userId, roomId: callData.roomId, error: error.message });
-    }
-  });
-
-  socket.on("call:resume", (callData) => {
-    try {
-      const { roomId } = callData;
-      log("info", "Call resume requested", { userId, roomId });
-      socket.to(roomId).emit("call:resume", callData);
-    } catch (error) {
-      log("error", "Error in call resume", { userId, roomId: callData.roomId, error: error.message });
-    }
-  });
-
-  // Handle screen sharing
-  socket.on("call:screen-sharing-started", (data) => {
-    try {
-      const { roomId } = data;
-      log("info", "Screen sharing started", { userId, roomId });
-      socket.to(roomId).emit("call:screen-sharing-started", data);
-    } catch (error) {
-      log("error", "Error in screen sharing started", { userId, roomId, error: error.message });
-    }
-  });
-
-  socket.on("call:screen-sharing-stopped", (data) => {
-    try {
-      const { roomId } = data;
-      log("info", "Screen sharing stopped", { userId, roomId });
-      socket.to(roomId).emit("call:screen-sharing-stopped", data);
-    } catch (error) {
-      log("error", "Error in screen sharing stopped", { userId, roomId, error: error.message });
-    }
-  });
-
-  // Handle participant management
-  socket.on("call:participant-added", (data) => {
-    try {
-      const { roomId, userId: newUserId } = data;
-      const call = activeCalls.get(roomId);
-      log("info", "Participant addition requested", { userId, newUserId, roomId });
-
-      if (call && !call.participants.includes(newUserId)) {
-        call.participants.push(newUserId);
-        activeCalls.set(roomId, call);
-        userRooms.set(newUserId, roomId);
-        io.to(roomId).emit("call:participant-added", data);
-        log("info", "Participant added successfully", { newUserId, roomId, participants: call.participants });
-      } else {
-        log("warn", "Participant addition failed: already in call or call does not exist", {
-          newUserId,
-          roomId,
-        });
-      }
-    } catch (error) {
-      log("error", "Error adding participant", { userId, roomId: data.roomId, error: error.message });
-    }
-  });
-
-  socket.on("call:participant-removed", (data) => {
-    try {
-      const { roomId, userId: removedUserId } = data;
-      const call = activeCalls.get(roomId);
-      log("info", "Participant removal requested", { userId, removedUserId, roomId });
-
-      if (call) {
-        call.participants = call.participants.filter(p => p !== removedUserId);
-        activeCalls.set(roomId, call);
-        userRooms.delete(removedUserId);
-        io.to(roomId).emit("call:participant-removed", data);
-        log("info", "Participant removed successfully", { removedUserId, roomId, participants: call.participants });
-
-        // If no participants left, clean up the call
-        if (call.participants.length === 0) {
-          cleanupCall(roomId);
-        }
-      } else {
-        log("warn", "Attempted to remove participant from non-existent call", { removedUserId, roomId });
-      }
-    } catch (error) {
-      log("error", "Error removing participant", { userId, roomId: data.roomId, error: error.message });
-    }
-  });
-
-  // Handle user disconnection
-  socket.on("disconnect", (reason) => {
-    log("info", "User disconnected", { userId, socketId: socket.id, reason });
-
-    // Clean up user data
-    userSockets.delete(userId);
-    const roomId = userRooms.get(userId);
-
-    if (roomId) {
-      const call = activeCalls.get(roomId);
-      if (call) {
-        // Notify other participants
-        socket.to(roomId).emit("call:participant-removed", {
-          roomId,
-          userId,
-          reason: "disconnected",
-        });
-        log("info", "Notified participants of user disconnection", { userId, roomId });
-
-        // Remove user from call
-        call.participants = call.participants.filter(p => p !== userId);
-        activeCalls.set(roomId, call);
-        log("debug", "User removed from call participants", { userId, roomId, participants: call.participants });
-
-        // If no participants left, clean up the call
-        if (call.participants.length === 0) {
-          cleanupCall(roomId);
-        }
-      }
-      userRooms.delete(userId);
-      log("debug", "User removed from userRooms", { userId, roomId });
-    }
-  });
-
-  // Handle errors
-  socket.on("error", (error) => {
-    log("error", "Socket error", { userId, socketId: socket.id, error: error.message });
-  });
-});
-
-// Clean up call resources
-function cleanupCall(roomId) {
-  const call = activeCalls.get(roomId);
-  if (call) {
-    // Remove all participants from userRooms
-    call.participants.forEach(userId => {
-      userRooms.delete(userId);
-      log("debug", "Removed user from userRooms during cleanup", { userId, roomId });
-    });
-
-    // Remove the call
-    activeCalls.delete(roomId);
-    log("info", "Cleaned up call", { roomId, participants: call.participants });
-  } else {
-    log("warn", "Attempted to clean up non-existent call", { roomId });
+function clearCallTimeout(callId) {
+  if (callTimeouts.has(callId)) {
+    clearTimeout(callTimeouts.get(callId));
+    callTimeouts.delete(callId);
+    console.log(`[TIMEOUT] Cleared timeout for call ${callId}`);
   }
 }
 
-// Health check endpoint
-app.get("/health", (req, res) => {
-  log("info", "Health check requested", { activeCalls: activeCalls.size, connectedUsers: userSockets.size });
-  res.status(200).json({
-    status: "OK",
-    activeCalls: activeCalls.size,
-    connectedUsers: userSockets.size,
+function setCallTimeout(callId, callback, delay) {
+  clearCallTimeout(callId);
+  const timeout = setTimeout(() => {
+    callTimeouts.delete(callId);
+    callback();
+  }, delay);
+  callTimeouts.set(callId, timeout);
+  console.log(`[TIMEOUT] Set timeout for call ${callId} (${delay}ms)`);
+}
+
+// Socket.IO
+io.on('connection', (socket) => {
+  console.log(`[CONNECT] Socket connected: ${socket.id}`);
+
+  // Register user
+  socket.on('register', ({ userId }) => {
+    if (!userId || typeof userId !== 'string') {
+      console.warn(`[REGISTER] Invalid userId: ${userId}`);
+      return socket.emit('error', { message: 'Invalid user ID' });
+    }
+
+    const existingSocket = getUserSocket(userId);
+    if (existingSocket && existingSocket.id !== socket.id) {
+      console.log(`[REPLACE] Replacing existing socket for ${userId}`);
+      existingSocket.emit('force_disconnect', { message: 'New connection established' });
+      existingSocket.disconnect();
+    }
+
+    connectedUsers.set(userId, socket);
+    socket.userId = userId;
+    setUserStatus(userId, 'available');
+
+    console.log(`[REGISTERED] User ${userId} registered (socket: ${socket.id})`);
+    socket.emit('registered', { success: true });
+
+    // Update participantSockets for active calls
+    for (const [callId, call] of activeCalls.entries()) {
+      if (call.participants.includes(userId) && !call.participantSockets[userId]) {
+        call.participantSockets[userId] = socket;
+        console.log(`[UPDATE] Added socket for ${userId} to call ${callId}`);
+      }
+    }
+
+    deliverPendingSignals(userId, socket);
   });
-});
 
-// Get active calls endpoint (for debugging/admin)
-app.get("/calls", (req, res) => {
-  const calls = Array.from(activeCalls.entries()).map(([roomId, callData]) => ({
-    roomId,
-    ...callData,
-  }));
-  log("info", "Active calls requested", { callCount: calls.length });
-  res.status(200).json({ calls });
-});
+  // Update user status
+  socket.on('user_status', ({ userId, status }) => {
+    if (userId && socket.userId === userId) setUserStatus(userId, status);
+  });
 
-// Get user call status endpoint
-app.get("/user/:userId/call-status", (req, res) => {
-  const { userId } = req.params;
-  const roomId = userRooms.get(userId);
-  log("info", "User call status requested", { userId, roomId });
+  // Initiate call
+  socket.on('call_initiate', (data) => {
+    const { callId, callerId, receiverIds, callType, extraMeta } = data;
+    if (!callId || !callerId || !receiverIds || receiverIds.length === 0) {
+      console.warn(`[CALL INIT] Missing data`, data);
+      return socket.emit('error', { message: 'Invalid call data' });
+    }
 
-  if (!roomId) {
-    return res.status(200).json({ inCall: false });
+    const callerSocket = getUserSocket(callerId);
+    if (!callerSocket) {
+      console.warn(`[CALL INIT] Caller ${callerId} not connected`);
+      return socket.emit('error', { message: 'Caller not connected' });
+    }
+
+    const receiverId = receiverIds[0];
+    const receiverStatus = getUserStatus(receiverId);
+    if (receiverStatus.status === 'busy') {
+      console.log(`[CALL BUSY] Receiver ${receiverId} is busy`);
+      return callerSocket.emit('call_busy', { callId, receiverId });
+    }
+
+    // Clear any stale call state
+    if (activeCalls.has(callId)) {
+      console.warn(`[CALL INIT] Overwriting stale call ${callId}`);
+      activeCalls.delete(callId);
+    }
+
+    // Create call entry
+    activeCalls.set(callId, {
+      callId,
+      callerId,
+      receiverIds,
+      callType,
+      participants: [callerId, receiverId],
+      participantSockets: { [callerId]: callerSocket },
+      status: 'initiated',
+      extraMeta,
+    });
+    
+    // Initialize call state machine
+    callStates.set(callId, {
+      status: 'initiated',
+      callerId,
+      receiverId,
+      offerAttempts: 0,
+      lastOfferTime: Date.now(),
+      iceCandidates: { [callerId]: [], [receiverId]: [] }
+    });
+
+    console.log(`[CALL INIT] Created call ${callId} with participants: ${[callerId, receiverId].join(', ')}`);
+
+    setUserStatus(callerId, 'busy', callId);
+
+    // Timeout if no answer in 60s
+    setCallTimeout(callId, () => {
+      const call = activeCalls.get(callId);
+      if (call && call.status === 'initiated') {
+        console.log(`[CALL TIMEOUT] Call ${callId} no answer`);
+        callerSocket.emit('call_timeout', { callId, reason: 'No answer' });
+        Object.values(call.participantSockets).forEach(sock => {
+          if (sock) sock.emit('call_ended', { callId, userId: 'system', reason: 'Timeout' });
+        });
+        activeCalls.delete(callId);
+        callStates.delete(callId);
+        setUserStatus(callerId, 'available');
+        setUserStatus(receiverId, 'available');
+      }
+    }, 60000);
+
+    // Send incoming call to receiver
+    const receiverSocket = getUserSocket(receiverId);
+    if (receiverSocket) {
+      setUserStatus(receiverId, 'ringing', callId);
+      receiverSocket.emit('incoming_call', data);
+      
+      // Notify caller that receiver is ringing
+      callerSocket.emit('call_ringing', { callId, receiverId });
+      
+      console.log(`[CALL] Incoming call sent to ${receiverId} (callId: ${callId})`);
+    } else {
+      console.warn(`[CALL] Receiver ${receiverId} not connected, queuing signal`);
+      queueSignal(receiverId, 'incoming_call', data);
+    }
+  });
+
+  // Accept call
+  socket.on('call_accept', ({ callId, receiverId }) => {
+    const call = activeCalls.get(callId);
+    if (!call) {
+      console.warn(`[CALL ACCEPT] Call ${callId} not found`);
+      return socket.emit('error', { message: 'Call not found' });
+    }
+
+    const receiverSocket = getUserSocket(receiverId);
+    if (!receiverSocket) {
+      console.warn(`[CALL ACCEPT] Receiver ${receiverId} not connected`);
+      return socket.emit('error', { message: 'Receiver not connected' });
+    }
+
+    if (!call.participants.includes(receiverId)) {
+      console.warn(`[CALL ACCEPT] Receiver ${receiverId} not in call participants`, call.participants);
+      return socket.emit('error', { message: 'Invalid receiver' });
+    }
+
+    clearCallTimeout(callId);
+    call.participantSockets[receiverId] = receiverSocket;
+    call.status = 'active';
+    setUserStatus(receiverId, 'in-call', callId);
+    setUserStatus(call.callerId, 'in-call', callId);
+
+    // Update call state
+    const callState = callStates.get(callId);
+    if (callState) {
+      callState.status = 'active';
+    }
+
+    // Notify participants
+    Object.entries(call.participantSockets).forEach(([uid, sock]) => {
+      if (sock && uid !== receiverId) {
+        sock.emit('call_accepted', { callId, receiverId });
+        console.log(`[CALL] Notified ${uid} of acceptance by ${receiverId} (call: ${callId})`);
+      }
+    });
+
+    // Signal start
+    Object.values(call.participantSockets).forEach(sock => {
+      if (sock) {
+        sock.emit('start_signaling', { callId });
+        console.log(`[SIGNAL] Emitted start_signaling to ${sock.userId} for call ${callId}`);
+      }
+    });
+    console.log(`[SIGNAL] start_signaling emitted for call ${callId}`);
+  });
+
+  // Reject call
+  socket.on('call_reject', ({ callId, userId }) => {
+    const call = activeCalls.get(callId);
+    if (!call) {
+      console.warn(`[CALL REJECT] Call ${callId} not found`);
+      return;
+    }
+
+    clearCallTimeout(callId);
+    setUserStatus(call.callerId, 'available');
+    setUserStatus(userId, 'available');
+
+    const callerSocket = getUserSocket(call.callerId);
+    callerSocket?.emit('call_rejected', { callId, userId });
+    console.log(`[CALL] ${userId} rejected call ${callId}`);
+
+    activeCalls.delete(callId);
+    callStates.delete(callId);
+  });
+
+  // WebRTC signaling
+  socket.on('webrtc_offer', ({ callId, from, to, sdp }) => {
+    console.log(`[SIGNAL] OFFER from ${from} to ${to} (call ${callId})`);
+    const call = activeCalls.get(callId);
+    const callState = callStates.get(callId);
+    
+    if (!call || !callState) {
+      console.warn(`[SIGNAL] Offer for unknown call ${callId}`);
+      queueSignal(to, 'webrtc_offer', { callId, from, sdp });
+      return;
+    }
+    
+    // Track offer attempts for retry logic
+    callState.offerAttempts += 1;
+    callState.lastOfferTime = Date.now();
+    
+    if (from === to) {
+      console.warn(`[SIGNAL] Offer loopback detected, from=${from}, to=${to}`);
+      return;
+    }
+
+    const targetSocket = call.participantSockets[to] || getUserSocket(to);
+    if (targetSocket && targetSocket.userId === to) {
+      targetSocket.emit('webrtc_offer', { callId, from, sdp });
+      console.log(`[SIGNAL] Forwarded offer to ${to} (socket: ${targetSocket.id})`);
+    } else {
+      console.warn(`[SIGNAL] No socket for ${to}, queuing offer`);
+      queueSignal(to, 'webrtc_offer', { callId, from, sdp });
+    }
+  });
+
+  socket.on('webrtc_answer', ({ callId, from, to, sdp }) => {
+    console.log(`[SIGNAL] ANSWER from ${from} to ${to} (call ${callId})`);
+    const call = activeCalls.get(callId);
+    const callState = callStates.get(callId);
+    
+    if (!call || !callState) {
+      console.warn(`[SIGNAL] Answer for unknown call ${callId}`);
+      queueSignal(to, 'webrtc_answer', { callId, from, sdp });
+      return;
+    }
+    
+    // Reset offer attempts on successful answer
+    callState.offerAttempts = 0;
+
+    const targetSocket = call.participantSockets[to] || getUserSocket(to);
+    if (targetSocket && targetSocket.userId === to) {
+      targetSocket.emit('webrtc_answer', { callId, from, sdp });
+      console.log(`[SIGNAL] Forwarded answer to ${to} (socket: ${targetSocket.id})`);
+    } else {
+      console.warn(`[SIGNAL] No socket for ${to}, queuing answer`);
+      queueSignal(to, 'webrtc_answer', { callId, from, sdp });
+    }
+  });
+
+  socket.on('ice_candidate', ({ callId, from, to, candidate }) => {
+    console.log(`[SIGNAL] ICE from ${from} to ${to} (call ${callId})`);
+    const call = activeCalls.get(callId);
+    const callState = callStates.get(callId);
+    
+    if (!call || !callState) {
+      console.warn(`[SIGNAL] ICE candidate for unknown call ${callId}`);
+      // Queue for later delivery if call might be established soon
+      queueSignal(to, 'ice_candidate', { callId, from, candidate });
+      return;
+    }
+    
+    // Store candidate for potential retransmission
+    if (callState.iceCandidates[to]) {
+      callState.iceCandidates[to].push({ from, candidate, timestamp: Date.now() });
+    }
+
+    const targetSocket = call.participantSockets[to] || getUserSocket(to);
+    if (targetSocket && targetSocket.userId === to) {
+      targetSocket.emit('ice_candidate', { callId, from, candidate });
+      console.log(`[SIGNAL] Forwarded ICE candidate to ${to} (socket: ${targetSocket.id})`);
+    } else {
+      console.warn(`[SIGNAL] No socket for ${to}, queuing ICE candidate`);
+      queueSignal(to, 'ice_candidate', { callId, from, to, candidate });
+    }
+  });
+
+// Add this to your server code - replace the existing call_end handler
+socket.on('call_end', ({ callId, userId }) => {
+  if (!userId || typeof userId !== 'string') {
+    console.warn(`[CALL END] Invalid userId: ${userId}`);
+    return;
+  }
+  
+  const call = activeCalls.get(callId);
+  if (!call) {
+    console.warn(`[CALL END] Call ${callId} not found`);
+    return;
   }
 
-  const callData = activeCalls.get(roomId);
-  res.status(200).json({
-    inCall: true,
-    roomId,
-    callData,
+  console.log(`[CALL END] User ${userId} ending call ${callId}`);
+  
+  clearCallTimeout(callId);
+  setUserStatus(userId, 'available');
+  
+  // Notify all other participants
+  Object.entries(call.participantSockets).forEach(([uid, sock]) => {
+    if (sock && uid !== userId) {
+      sock.emit('call_ended', { 
+        callId, 
+        userId, 
+        reason: 'User ended the call' 
+      });
+      console.log(`[CALL] Notified ${uid} of call end by ${userId}`);
+    }
+  });
+  
+  // Remove user from call participants
+  call.participants = call.participants.filter(id => id !== userId);
+  delete call.participantSockets[userId];
+  
+  console.log(`[CALL] ${userId} ended call ${callId}`);
+
+  // Clean up if no participants left
+  if (call.participants.length === 0) {
+    activeCalls.delete(callId);
+    callStates.delete(callId);
+    console.log(`[CALL] Call ${callId} deleted (no participants left)`);
+  }
+});
+
+// Add this new event handler for user ready notification
+socket.on('user_ready', ({ callId, userId }) => {
+  console.log(`[USER READY] User ${userId} ready for call ${callId}`);
+  const call = activeCalls.get(callId);
+  
+  if (!call) {
+    console.warn(`[USER READY] Call ${callId} not found`);
+    return;
+  }
+  
+  // Update participant socket
+  const userSocket = getUserSocket(userId);
+  if (userSocket) {
+    call.participantSockets[userId] = userSocket;
+    console.log(`[USER READY] Updated socket for ${userId} in call ${callId}`);
+  }
+  
+  // If both users are ready, start signaling
+  const allReady = call.participants.every(pid => call.participantSockets[pid]);
+  if (allReady) {
+    console.log(`[CALL READY] All participants ready for call ${callId}`);
+    Object.values(call.participantSockets).forEach(sock => {
+      if (sock) {
+        sock.emit('start_signaling', { callId });
+        console.log(`[SIGNAL] Emitted start_signaling to ${sock.userId}`);
+      }
+    });
+  }
+});
+  // Disconnect
+  socket.on('disconnect', (reason) => {
+    const userId = socket.userId || 'unknown';
+    connectedUsers.delete(userId);
+    console.log(`[DISCONNECT] ${userId} disconnected (reason: ${reason})`);
+
+    for (const [callId, call] of activeCalls.entries()) {
+      if (call.participants.includes(userId)) {
+        call.participants = call.participants.filter(id => id !== userId);
+        delete call.participantSockets[userId];
+        Object.values(call.participantSockets).forEach(sock => {
+          if (sock) {
+            sock.emit('call_ended', { callId, userId, reason: 'Participant disconnected' });
+            console.log(`[CALL] Notified ${sock.userId} of ${userId} disconnect from call ${callId}`);
+          }
+        });
+        setUserStatus(userId, 'offline');
+        console.log(`[CALL] Notified participants ${userId} disconnected from call ${callId}`);
+
+        if (call.participants.length === 0) {
+          activeCalls.delete(callId);
+          callStates.delete(callId);
+          console.log(`[CALL] Call ${callId} deleted (no participants left)`);
+        }
+      }
+    }
+  });
+
+  socket.on('error', (err) => console.error('[SOCKET ERROR]', err));
+});
+
+// Call state monitoring for timeouts
+setInterval(() => {
+  const now = Date.now();
+  for (const [callId, callState] of callStates.entries()) {
+    const call = activeCalls.get(callId);
+    
+    // Check for offer timeouts (no answer within 10s)
+    if (callState.status === 'initiated' && 
+        callState.offerAttempts > 0 &&
+        now - callState.lastOfferTime > 10000) {
+      
+      console.log(`[TIMEOUT] Call ${callId} offer timeout`);
+      const callerSocket = getUserSocket(callState.callerId);
+      if (callerSocket) {
+        callerSocket.emit('call_timeout', { 
+          callId, 
+          reason: 'No answer from receiver' 
+        });
+      }
+      
+      // Clean up
+      activeCalls.delete(callId);
+      callStates.delete(callId);
+      setUserStatus(callState.callerId, 'available');
+      setUserStatus(callState.receiverId, 'available');
+    }
+    
+    // Clean up old ICE candidates (older than 1 minute)
+    for (const userId in callState.iceCandidates) {
+      callState.iceCandidates[userId] = callState.iceCandidates[userId].filter(
+        c => now - c.timestamp < 60000
+      );
+    }
+  }
+}, 5000); // Run every 5 seconds
+
+// Health check
+app.get('/health', (_, res) => {
+  res.json({
+    status: 'OK',
+    connectedUsers: Array.from(connectedUsers.keys()),
+    activeCalls: Array.from(activeCalls.entries()).map(([callId, call]) => ({
+      callId,
+      participants: call.participants,
+      status: call.status,
+      participantSockets: Object.keys(call.participantSockets),
+    })),
+    userStatus: Object.fromEntries(userStatus),
   });
 });
 
-const PORT = process.env.PORT || 8083;
-server.listen(PORT, () => {
-  log("info", "WebRTC signaling server started", { port: PORT });
-});
-
-// Graceful shutdown
-process.on("SIGINT", () => {
-  log("info", "Shutting down server gracefully");
-  io.emit("server:shutting-down", { message: "Server is restarting, please reconnect" });
-  setTimeout(() => {
-    log("info", "Server shutdown complete");
-    process.exit(0);
-  }, 1000);
-});
+app.get('/', (_, res) => res.send('WebRTC Signaling Server running'));
+server.listen(8083, () => console.log('[SERVER] Listening on port 8083'));
